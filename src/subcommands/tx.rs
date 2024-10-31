@@ -1,3 +1,4 @@
+use ckb_hash::{blake2b_256, new_blake2b};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fs;
@@ -232,6 +233,46 @@ impl<'a> TxSubCommand<'a> {
                     .arg(arg_require_first_n.clone())
                     .arg(arg_threshold.clone())
                     .arg(arg_since_absolute_epoch.clone()),
+                App::new("build-typeid-args")
+                    .about("Build args for typeid (hash of inputs[0] and output index)")
+                    .arg(
+                        Arg::with_name("output-index")
+                            .long("output-index")
+                            .takes_value(true)
+                            .default_value("0")
+                            .required(true)
+                            .validator(|input| input.parse::<u64>())
+                            .about("output index of typeid cell"),
+                    )
+                    .arg(arg_tx_file.clone()),
+                App::new("amount2bytes")
+                    .about("convert token amount to bytes as little end uint128")
+                    .arg(
+                        Arg::with_name("amount")
+                            .long("amount")
+                            .takes_value(true)
+                            .default_value("0")
+                            .required(true)
+                            .validator(|input| input.parse::<u128>())
+                            .about("amount of token"),
+                    ),
+                App::new("calc-type-hash")
+                    .about("Calc type hash for given output index")
+                    .arg(
+                        Arg::with_name("output-index")
+                            .long("output-index")
+                            .takes_value(true)
+                            .default_value("0")
+                            .required(true)
+                            .validator(|input| input.parse::<u64>())
+                            .about("output index of cell"),
+                    )
+                    .arg(arg_tx_file.clone()),
+                App::new("export-offline-tx")
+                    .about(
+                        "export raw transactions into transactions that Neuron can offline sign.",
+                    )
+                    .arg(arg_tx_file.clone()),
             ])
     }
 }
@@ -583,6 +624,186 @@ impl<'a> CliSubCommand for TxSubCommand<'a> {
                     "testnet": Address::new(NetworkType::Testnet, address_payload.clone(), true).to_string(),
                     "lock-arg": format!("0x{}", hex_string(address_payload.args().as_ref())),
                     "lock-hash": format!("{:#x}", lock_script.calc_script_hash())
+                });
+                Ok(Output::new_output(resp))
+            }
+            ("build-typeid-args", Some(m)) => {
+                let output_index: u64 =
+                    FromStrParser::<u64>::default().from_matches(m, "output-index")?;
+                let tx_file: PathBuf = FilePathParser::new(false).from_matches(m, "tx-file")?;
+
+                let typeid_args = modify_tx_file(&tx_file, network, |helper| {
+                    let mut blake2b = new_blake2b();
+                    blake2b.update(helper.transaction().inputs().get(0).unwrap().as_slice());
+                    blake2b.update(output_index.to_le_bytes().as_slice());
+                    let mut hash = [0u8; 32];
+                    blake2b.finalize(&mut hash);
+                    let hash = H256::from(hash);
+
+                    Ok(format!("{hash:#x}"))
+                })?;
+
+                let resp = serde_json::json!({
+                    "typeid-args": typeid_args
+                });
+                Ok(Output::new_output(resp))
+            }
+            ("amount2bytes", Some(m)) => {
+                let amount: u128 = FromStrParser::<u128>::default().from_matches(m, "amount")?;
+                let data = amount.to_le_bytes().to_vec();
+
+                let resp = serde_json::json!({
+                    "data": format!("0x{}", faster_hex::hex_string(data.as_slice()))
+                });
+                Ok(Output::new_output(resp))
+            }
+            ("calc-type-hash", Some(m)) => {
+                let output_index: u64 =
+                    FromStrParser::<u64>::default().from_matches(m, "output-index")?;
+                let tx_file: PathBuf = FilePathParser::new(false).from_matches(m, "tx-file")?;
+
+                let type_hash = modify_tx_file(&tx_file, network, |helper| {
+                    let mut blake2b = new_blake2b();
+                    blake2b.update(
+                        helper
+                            .transaction()
+                            .output(output_index as usize)
+                            .unwrap()
+                            .type_()
+                            .as_slice(),
+                    );
+                    let mut hash = [0u8; 32];
+                    blake2b.finalize(&mut hash);
+                    let hash = H256::from(hash);
+
+                    Ok(format!("{hash:#x}"))
+                })?;
+
+                let resp = serde_json::json!({
+                    "type-hash": type_hash
+                });
+                Ok(Output::new_output(resp))
+            }
+            ("export-offline-tx", Some(m)) => {
+                let tx_file: PathBuf = FilePathParser::new(false).from_matches(m, "tx-file")?;
+
+                let file = fs::File::open(tx_file).map_err(|err| err.to_string())?;
+                let repr: ReprTxHelper =
+                    serde_json::from_reader(&file).map_err(|err| err.to_string())?;
+                //let helper = TxHelper::try_from(repr.clone())?;
+
+                let version = repr.transaction.version;
+                let mut offline_cell_deps = Vec::new();
+                for cell_dep in repr.transaction.cell_deps {
+                    let offline_cell_dep = serde_json::json!({
+                        "outPoint": {
+                            "txHash": format!("{:#x}", cell_dep.out_point.tx_hash),
+                            "index": cell_dep.out_point.index
+                        },
+                        "depType": cell_dep.dep_type
+                    });
+                    offline_cell_deps.push(offline_cell_dep);
+                }
+
+                let header_deps = repr.transaction.header_deps;
+
+                let mut live_cell_cache: HashMap<(OutPoint, bool), (CellOutput, Bytes)> =
+                    Default::default();
+                let mut get_live_cell = |out_point: OutPoint, with_data: bool| {
+                    get_live_cell_with_cache(
+                        &mut live_cell_cache,
+                        self.rpc_client,
+                        out_point,
+                        with_data,
+                    )
+                    .map(|(output, _)| output)
+                };
+                let mut offline_inputs = Vec::new();
+                let mut contex_tx_hashes = Vec::new();
+                for input in repr.transaction.inputs.into_iter() {
+                    contex_tx_hashes.push(input.previous_output.tx_hash.clone());
+                    let input_cell = get_live_cell(input.previous_output.clone().into(), false)?;
+                    let lock_hash = H256::from(blake2b_256(input_cell.lock().as_slice()));
+                    let unpacked_input_cell: ckb_jsonrpc_types::CellOutput = input_cell.into();
+
+                    let offline_input = serde_json::json!({
+                        "since": input.since,
+                        "previousOutput": {
+                            "txHash": format!("{:#x}", input.previous_output.tx_hash),
+                            "index": input.previous_output.index,
+                        },
+                        "capacity": unpacked_input_cell.capacity,
+                        "lock": {
+                            "codeHash": format!("{:#x}", unpacked_input_cell.lock.code_hash),
+                            "hashType": unpacked_input_cell.lock.hash_type,
+                            "args": unpacked_input_cell.lock.args
+                        },
+                        "lockHash": format!("{lock_hash:#x}"),
+                    });
+                    offline_inputs.push(offline_input);
+                }
+
+                let mut offline_outputs = Vec::new();
+                for output in repr.transaction.outputs {
+                    let offline_output = if let Some(output_type) = output.type_ {
+                        serde_json::json!({
+                            "capacity": output.capacity,
+                            "lock": {
+                              "codeHash": format!("{:#x}", output.lock.code_hash),
+                              "hashType": output.lock.hash_type,
+                              "args": output.lock.args
+                            },
+                            "type": {
+                                "codeHash": format!("{:#x}", output_type.code_hash),
+                                "hashType": output_type.hash_type,
+                                "args": output_type.args
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "capacity": output.capacity,
+                            "lock": {
+                              "codeHash": format!("{:#x}", output.lock.code_hash),
+                              "hashType": output.lock.hash_type,
+                              "args": output.lock.args
+                            },
+                            "type": null
+                        })
+                    };
+                    offline_outputs.push(offline_output);
+                }
+
+                let outputs_data = repr.transaction.outputs_data;
+
+                let offline_tx = serde_json::json!({
+                    "description": "",
+                    "nervosDao": false,
+                    "signatures": {},
+                    "fee": "-1000000",
+                    "version": version,
+                    "cellDeps": offline_cell_deps,
+                    "headerDeps": header_deps,
+                    "inputs": offline_inputs,
+                    "outputs": offline_outputs,
+                    "outputsData": outputs_data,
+                    "witnesses": []
+                });
+
+                let mut context_txs = Vec::new();
+                for hash in contex_tx_hashes {
+                    let resp = self.rpc_client.get_transaction(hash)?;
+
+                    let tx_with_status = resp.unwrap();
+                    if let Some(tx) = tx_with_status.transaction {
+                        context_txs.push(tx);
+                    }
+                }
+
+                let resp = serde_json::json!({
+                    "transaction": offline_tx,
+                    "context": context_txs,
+                    "type": "Regular",
+                    "status": "Unsigned"
                 });
                 Ok(Output::new_output(resp))
             }
